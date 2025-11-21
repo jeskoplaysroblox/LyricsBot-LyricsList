@@ -1,2 +1,3 @@
 # RblxSongSystem
-Contains song lyrics
+# Contains song lyrics
+*Created solely as a database*
