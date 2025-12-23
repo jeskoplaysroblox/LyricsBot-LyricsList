@@ -109,6 +109,26 @@ def bind_mousewheel(widget, canvas):
         canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     widget.bind_all("<MouseWheel>", _on_mousewheel)
 
+def translate_and_cache_word(word):
+    word = word.lower().strip()
+
+    if len(word) < 2:
+        return
+    if not any(c.isalpha() for c in word):
+        return
+    if " " in word:
+        return
+
+    # Translate
+    fi = translate_en_to_fi_with_cache_and_overrides(word)
+
+    # Skip nonsense
+    if fi.lower() == word:
+        return
+
+    # Cache
+    store_translation(word, fi)
+
 def create_scrollable_frame(parent):
     canvas = tk.Canvas(parent, bg="#222222", highlightthickness=0)
     scrollbar = tk.Scrollbar(
@@ -184,26 +204,69 @@ def fetch_synonyms_from_api(word):
     except Exception:
         return [word]
 
+def is_valid_word_for_synonyms(word):
+    word = word.strip().lower()
+
+    # Must be at least 2 characters
+    if len(word) < 2:
+        return False
+
+    # Must contain letters
+    if not any(c.isalpha() for c in word):
+        return False
+
+    # Must not contain spaces
+    if " " in word:
+        return False
+
+    # Must not be identical to its translation (nonsense words)
+    fi = translate_en_to_fi_with_cache_and_overrides(word)
+    if fi.lower() == word:
+        return False
+
+    return True
+
 def get_synonyms(word):
     word = word.lower().strip()
-    if not word:
+
+    # Validate the input word
+    if not is_valid_word_for_synonyms(word):
         return []
+
+    # Check DB first
     with lex_lock:
         lex_cur.execute("SELECT synonyms FROM synonyms WHERE english = ?", (word,))
         row = lex_cur.fetchone()
+
     if row:
         stored = row[0]
         if stored:
             return stored.split(",")
+
+    # Fetch from API
     syns = fetch_synonyms_from_api(word)
-    joined = ",".join(syns)
+
+    # Validate each synonym
+    clean_syns = []
+    for syn in syns:
+        syn_clean = syn.strip().lower()
+        if is_valid_word_for_synonyms(syn_clean):
+            clean_syns.append(syn_clean)
+
+    # Auto-translate and cache each synonym
+    for syn in clean_syns:
+        translate_and_cache_word(syn)
+
+    # Save synonyms list
+    joined = ",".join(clean_syns)
     with lex_lock:
         lex_cur.execute(
             "INSERT OR REPLACE INTO synonyms (english, synonyms) VALUES (?, ?)",
             (word, joined)
         )
         lex_conn.commit()
-    return syns
+
+    return clean_syns
 
 def get_override(english_word):
     english_word = english_word.lower().strip()
@@ -250,10 +313,58 @@ def get_translation_from_cache(word):
         row = lex_cur.fetchone()
     return row[0] if row else None
 
+def translate_en_to_fi_raw(word):
+    """
+    Raw English → Finnish translation.
+    Does NOT call lookup_word().
+    Does NOT use overrides.
+    Does NOT use cache.
+    Does NOT store results.
+    Safe for translating synonyms without recursion.
+    """
+
+    word = word.lower().strip()
+    if not word:
+        return ""
+
+    try:
+        # Direct API call — same one used in your main translator
+        fi = translator_en_fi.translate(word)
+        if fi:
+            return fi.strip()
+    except Exception:
+        pass
+
+    # If API fails, return the original word
+    return word
+
+def translate_and_cache_synonyms(word):
+    syns = get_synonyms(word)  # this is safe
+
+    for syn in syns:
+        syn = syn.strip().lower()
+
+        # Same validation rules as store_translation
+        if len(syn) <= 1:
+            continue
+        if not any(c.isalpha() for c in syn):
+            continue
+
+        # Raw translation only — NOT lookup_word()
+        fi = translate_en_to_fi_raw(syn)
+
+        # Skip nonsense
+        if fi.lower() == syn:
+            continue
+
+        store_translation(syn, fi)
 
 def store_translation(word, finnish):
     word = word.lower().strip()
     finnish = finnish.strip()
+    if " " in word:
+        return
+
 
     # RULE 1: Do not store 1-character "words"
     if len(word) <= 1:
@@ -291,6 +402,8 @@ def translate_en_to_fi_with_cache_and_overrides(word):
     if fi:
         store_translation(word, fi)
     return fi
+
+
 
 def translate_fi_to_en(text):
     text = text.strip()
@@ -365,8 +478,9 @@ def render_results(gen, items):
             row.bind("<Button-1>", on_click)
             row.pack(fill="x")
 
-
+complete = False
 def background_lookup(word, gen):
+    global complete
     if word.startswith("!"):
         fi_text = word[1:].strip()
         en = translate_fi_to_en(fi_text)
@@ -378,43 +492,40 @@ def background_lookup(word, gen):
         fi_sentence = translate_en_to_fi_with_cache_and_overrides(word)
         root.after(0, lambda: render_results(gen, [(fi_sentence, word)]))
 
-        # --- WORD-BY-WORD CACHING LOGIC ---
-
         tokens = word.strip().split()
         if not tokens:
             return
 
-        last_token = tokens[-1]
-        last_char = word[-1]
+        completed_words = []
 
-        # Determine if the last word is complete
-        complete = False
-
-        if last_char == " ":
-            complete = True
-        elif last_char in ".?!,":
-            complete = True
+        # If the sentence ends with a space or punctuation, ALL tokens are complete
+        if word[-1] == " " or word[-1] in ".?!,":
+            completed_words = tokens
         else:
-            # Not complete, do not cache
-            return
+            # Otherwise, all except the last token are complete
+            if len(tokens) > 1:
+                completed_words = tokens[:-1]
 
-        # Clean the word
-        clean = last_token.strip(".,?!").lower()
+        # Cache each completed word
+        for token in completed_words:
+            clean = token.strip(".,?!").lower()
 
-        # Validate: must be a real word
-        if len(clean) < 2:
-            return
-        if not any(c.isalpha() for c in clean):
-            return
+            if len(clean) < 2:
+                continue
+            if not any(c.isalpha() for c in clean):
+                continue
 
-        # Check if translation is identical (skip nonsense words)
-        fi_word = translate_en_to_fi_with_cache_and_overrides(clean)
-        if fi_word.lower() == clean:
-            return
+            fi_word = translate_en_to_fi_with_cache_and_overrides(clean)
 
-        # Cache the single word
-        store_translation(clean, fi_word)
+            if fi_word.lower() == clean:
+                continue
 
+            store_translation(clean, fi_word)
+            # After translating & caching the main word
+            store_translation(clean, fi_word)
+
+            # Now auto-translate synonyms safely
+            translate_and_cache_synonyms(clean)
         return
     items = lookup_word(word)
     root.after(0, lambda: render_results(gen, items))
