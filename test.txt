@@ -1,0 +1,653 @@
+from deep_translator import GoogleTranslator
+import tkinter as tk
+import re, sys, os, json, keyboard, threading, requests, sqlite3
+shutdown_flag = False
+settings_panel = None
+settings_visible = False
+translator_en_fi = GoogleTranslator(source="en", target="fi")
+translator_fi_en = GoogleTranslator(source="fi", target="en")
+lex_conn = sqlite3.connect("lexicon.db", check_same_thread=False)
+lex_cur = lex_conn.cursor()
+lex_lock = threading.Lock()
+over_conn = sqlite3.connect("overrides.db", check_same_thread=False)
+over_cur = over_conn.cursor()
+over_lock = threading.Lock()
+
+style = {
+    "bg": "#222222",
+    "troughcolor": "#222222",
+    "activebackground": "#444444",
+    "highlightthickness": 0,
+    "bd": 0,
+    "width": 0
+}
+
+def shutdown_program():
+    global shutdown_flag
+    shutdown_flag = True
+    try:
+        keyboard.unhook_all()
+    except:
+        pass
+    try:
+        root.quit()
+    except:
+        pass
+    try:
+        root.destroy()
+    except:
+        pass
+    os._exit(0)
+
+def copy_to_clipboard(text):
+    root.clipboard_clear()
+    root.clipboard_append(text)
+    root.update()
+
+SETTINGS_FILE = "spotlight_settings.json"
+
+default_settings = {
+    "x": None,
+    "y": None,
+    "transparency": 1.0
+}
+
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return default_settings.copy()
+
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            data = f.read().strip()
+            if not data:
+                return default_settings.copy()
+            return json.loads(data)
+    except Exception:
+        return default_settings.copy()
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=4)
+
+def open_settings_window():
+    settings = load_settings()
+    win = tk.Toplevel(root)
+    win.title("Spotlight Settings")
+    win.geometry("300x200")
+    win.configure(bg="#222222")
+    win.attributes("-topmost", True)
+    tk.Label(win, text="Transparency", bg="#222222", fg="white").pack()
+    slider = tk.Scale(
+        win,
+        from_=0.2,
+        to=1.0,
+        resolution=0.01,
+        orient="horizontal",
+        bg="#222222",
+        fg="white",
+        highlightthickness=0
+    )
+    slider.set(settings["transparency"])
+    slider.pack()
+
+    def update_transparency(value):
+        if popup is not None:
+            popup.attributes("-alpha", float(value))
+
+    slider.configure(command=update_transparency)
+
+    def save_and_close():
+        settings["transparency"] = slider.get()
+        save_settings(settings)
+        win.destroy()
+
+    tk.Button(win, text="Save", command=save_and_close).pack(pady=10)
+
+def bind_mousewheel(widget, canvas):
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    widget.bind_all("<MouseWheel>", _on_mousewheel)
+
+def create_scrollable_frame(parent):
+    canvas = tk.Canvas(parent, bg="#222222", highlightthickness=0)
+    scrollbar = tk.Scrollbar(
+    parent,
+    orient="vertical",
+    command=canvas.yview,
+    bg=style["bg"],
+    troughcolor=style["troughcolor"],
+    activebackground=style["activebackground"],
+    highlightthickness=style["highlightthickness"],
+    bd=style["bd"],
+    width= 0
+)
+
+    scroll_frame = tk.Frame(canvas, bg="#222222")
+
+    scroll_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+
+    canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    bind_mousewheel(scroll_frame, canvas)
+
+    return scroll_frame
+
+lex_cur.execute("""
+CREATE TABLE IF NOT EXISTS synonyms (
+    english TEXT PRIMARY KEY,
+    synonyms TEXT
+)
+""")
+lex_cur.execute("""
+CREATE TABLE IF NOT EXISTS translations (
+    english TEXT PRIMARY KEY,
+    finnish TEXT
+)
+""")
+lex_conn.commit()
+
+over_cur.execute("""
+CREATE TABLE IF NOT EXISTS overrides (
+    english TEXT PRIMARY KEY,
+    finnish TEXT
+)
+""")
+over_conn.commit()
+punct_re = re.compile(rf"[{re.escape('!\"#$%&\'()*+,-./:;<=>?@[\\]^_`{{|}}~')}]")
+def normalize_token(s: str) -> str:
+    s = s.lower().strip()
+    s = punct_re.sub("", s)
+    return s
+
+def fetch_synonyms_from_api(word):
+    try:
+        resp = requests.get(
+            "https://api.datamuse.com/words",
+            params={"ml": word, "max": 10},
+            timeout=3
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        syns = [item["word"] for item in data if "word" in item]
+        syns = [s.lower() for s in syns if s.isalpha()]
+        if not syns:
+            syns = [word]
+        return syns
+    except Exception:
+        return [word]
+
+def get_synonyms(word):
+    word = word.lower().strip()
+    if not word:
+        return []
+    with lex_lock:
+        lex_cur.execute("SELECT synonyms FROM synonyms WHERE english = ?", (word,))
+        row = lex_cur.fetchone()
+    if row:
+        stored = row[0]
+        if stored:
+            return stored.split(",")
+    syns = fetch_synonyms_from_api(word)
+    joined = ",".join(syns)
+    with lex_lock:
+        lex_cur.execute(
+            "INSERT OR REPLACE INTO synonyms (english, synonyms) VALUES (?, ?)",
+            (word, joined)
+        )
+        lex_conn.commit()
+    return syns
+
+def get_override(english_word):
+    english_word = english_word.lower().strip()
+    if not english_word:
+        return None
+    with over_lock:
+        over_cur.execute("SELECT finnish FROM overrides WHERE english = ?", (english_word,))
+        row = over_cur.fetchone()
+    return row[0] if row else None
+
+def store_override(english_word, finnish_word):
+    english_word = english_word.lower().strip()
+    finnish_word = finnish_word.strip()
+    if not english_word or not finnish_word:
+        return
+    with over_lock:
+        over_cur.execute(
+            "INSERT OR REPLACE INTO overrides (english, finnish) VALUES (?, ?)",
+            (english_word, finnish_word)
+        )
+        over_conn.commit()
+
+
+def get_reverse_override(finnish_text):
+    if not finnish_text:
+        return None
+    norm = normalize_token(finnish_text)
+    if not norm or " " in norm:
+        return None
+    with over_lock:
+        over_cur.execute("SELECT english, finnish FROM overrides")
+        rows = over_cur.fetchall()
+    for en, fi in rows:
+        if normalize_token(fi) == norm:
+            return en
+    return None
+
+def get_translation_from_cache(word):
+    word = word.lower().strip()
+    if not word:
+        return None
+    with lex_lock:
+        lex_cur.execute("SELECT finnish FROM translations WHERE english = ?", (word,))
+        row = lex_cur.fetchone()
+    return row[0] if row else None
+
+
+def store_translation(word, finnish):
+    word = word.lower().strip()
+    finnish = finnish.strip()
+    if not word or not finnish:
+        return
+    with lex_lock:
+        lex_cur.execute(
+            "INSERT OR REPLACE INTO translations (english, finnish) VALUES (?, ?)",
+            (word, finnish)
+        )
+        lex_conn.commit()
+
+def translate_en_to_fi_with_cache_and_overrides(word):
+    word = word.lower().strip()
+    if not word:
+        return ""
+    ov = get_override(word)
+    if ov:
+        return ov
+    cached = get_translation_from_cache(word)
+    if cached:
+        return cached
+    try:
+        fi = translator_en_fi.translate(word)
+    except Exception:
+        fi = ""
+    if fi:
+        store_translation(word, fi)
+    return fi
+
+def translate_fi_to_en(text):
+    text = text.strip()
+    if not text:
+        return ""
+    rev = get_reverse_override(text)
+    if rev:
+        return rev
+    try:
+        en = translator_fi_en.translate(text)
+    except Exception:
+        en = ""
+    return en
+
+def lookup_word(word):
+    word = word.lower().strip()
+    if not word:
+        return []
+    syns = get_synonyms(word)
+    seen = set()
+    words = []
+    if word not in syns:
+        syns.insert(0, word)
+    for w in syns:
+        if w not in seen:
+            seen.add(w)
+            words.append(w)
+    results = []
+    for en in words:
+        fi = translate_en_to_fi_with_cache_and_overrides(en)
+        if fi:
+            results.append((fi, en))
+    return results
+
+root = tk.Tk()
+root.withdraw()
+
+popup = None
+results_frame = None
+entry_widget = None
+lookup_generation = 0
+ui_lock = threading.Lock()
+
+def render_results(gen, items):
+    global lookup_generation, results_frame
+    with ui_lock:
+        if gen != lookup_generation:
+            return
+        if results_frame is None:
+            return
+
+        for widget in results_frame.winfo_children():
+            widget.destroy()
+
+        for fi, en in items:
+            if fi and " " in en or en.startswith("!"):
+                text = f"{fi} ({en})"
+            else:
+                text = f"{fi} ({en})"
+            row = tk.Label(
+                results_frame,
+                text=f"{fi} ({en})",
+                font=("Segoe UI", 16),
+                bg="#222222",
+                fg="white",
+                anchor="w",
+                padx=10,
+                cursor="hand2"
+            )
+            def on_click(event, text=fi):
+                copy_to_clipboard(text)
+            row.bind("<Button-1>", on_click)
+            row.pack(fill="x")
+
+
+def background_lookup(word, gen):
+    if word.startswith("!"):
+        fi_text = word[1:].strip()
+        en = translate_fi_to_en(fi_text)
+        items = [(en, fi_text)]
+        root.after(0, lambda: render_results(gen, items))
+        return
+    if " " in word:
+        fi = translate_en_to_fi_with_cache_and_overrides(word)
+        items = [(fi, word)]
+        root.after(0, lambda: render_results(gen, items))
+        return
+    items = lookup_word(word)
+    root.after(0, lambda: render_results(gen, items))
+
+def on_entry_change(event=None):
+    global lookup_generation
+    if entry_widget is None:
+        return
+    word = entry_widget.get().strip()
+    lookup_generation += 1
+    current_gen = lookup_generation
+    if not word:
+        root.after(0, lambda: render_results(current_gen, []))
+        return
+    t = threading.Thread(target=background_lookup, args=(word, current_gen), daemon=True)
+    t.start()
+
+def close_popup(event=None):
+    global popup, entry_widget, results_frame
+    if popup is not None:
+        popup.destroy()
+        popup = None
+        entry_widget = None
+        results_frame = None
+
+def open_search_window():
+    global popup, results_frame, entry_widget, lookup_generation
+
+    if popup is not None:
+        return
+    w, h = 700, 320
+
+    settings = load_settings()
+
+    popup = tk.Toplevel(root)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    popup.configure(bg="#222222")
+
+    settings = load_settings()
+
+    sw = popup.winfo_screenwidth()
+    sh = popup.winfo_screenheight()
+    w, h = 700, 320
+
+    height_percent = settings.get("height_percent", 20)
+
+    y = int((sh * (height_percent / 100)) - (h // 2))
+    x = (sw - w) // 2
+
+    popup.geometry(f"{w}x{h}+{x}+{y}")
+
+    popup.attributes("-alpha", settings.get("transparency", 1.0))
+    def save_position(event):
+        settings = load_settings()
+        settings["x"] = popup.winfo_x()
+        settings["y"] = popup.winfo_y()
+        save_settings(settings)
+
+    popup.bind("<Configure>", save_position)
+
+    build_settings_panel(popup)
+    entry_widget = tk.Entry(
+        popup,
+        font=("Segoe UI", 20),
+        bg="#333333",
+        fg="white",
+        insertbackground="white",
+        relief="flat"
+    )
+    entry_widget.pack(fill="x", padx=16, pady=16)
+    entry_widget.focus_set()
+    popup.lift()
+    popup.focus_force()
+    entry_widget.focus_force()
+
+    results_frame = create_scrollable_frame(popup)
+
+    entry_widget.bind("<KeyRelease>", on_entry_change)
+    popup.bind("<Escape>", close_popup)
+
+    lookup_generation = 0
+    render_results(lookup_generation, [])
+    settings_button = tk.Label(
+        popup,
+        text="⚙",
+        font=("Segoe UI", 18),
+        bg="#333333",
+        fg="white",
+        cursor="hand2"
+    )
+    settings_button.place(relx=0.96, rely=0.057, anchor="ne")
+    settings_button.bind("<Button-1>", lambda e: toggle_settings_panel())
+keyboard.add_hotkey("shift+n", open_search_window)
+
+RESET = "\033[0m"
+FI_COLOR = "\033[38;2;121;77;253m"
+EN_COLOR = "\033[38;2;67;246;54m"
+
+def build_settings_panel(parent):
+    global settings_panel
+
+    settings = load_settings()
+
+    settings_panel = tk.Frame(parent, bg="#1e1e1e", height=150)
+
+    canvas = tk.Canvas(settings_panel, bg="#1e1e1e", highlightthickness=0)
+    scrollbar = tk.Scrollbar(settings_panel, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, bg="#1e1e1e")
+    inner.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    tk.Label(inner, text="Transparency", bg="#1e1e1e", fg="white").pack(anchor="w", padx=10)
+    trans_slider = tk.Scale(
+        inner,
+        from_=0.2,
+        to=1.0,
+        resolution=0.01,
+        orient="horizontal",
+        bg="#1e1e1e",
+        fg="white",
+        highlightthickness=0
+    )
+    trans_slider.set(settings.get("transparency", 1.0))
+    trans_slider.pack(fill="x", padx=10)
+
+    def update_transparency(value):
+        if popup is not None:
+            popup.attributes("-alpha", float(value))
+
+    trans_slider.configure(command=update_transparency)
+
+    tk.Label(inner, text="Spotlight Vertical Position", bg="#1e1e1e", fg="white").pack(anchor="w", padx=10)
+    height_slider = tk.Scale(
+        inner,
+        from_=0,
+        to=100,
+        resolution=1,
+        orient="horizontal",
+        bg="#1e1e1e",
+        fg="white",
+        highlightthickness=0
+    )
+    height_slider.set(settings.get("height_percent", 20))
+    height_slider.pack(fill="x", padx=10)
+
+    def update_height(value):
+        if popup is not None:
+            sw = popup.winfo_screenwidth()
+            sh = popup.winfo_screenheight()
+            w, h = 700, 320
+            y = int((sh * (int(value) / 100)) - (h // 2))
+            x = (sw - w) // 2
+            popup.geometry(f"{w}x{h}+{x}+{y}")
+
+    height_slider.configure(command=update_height)
+
+    def save_settings_panel():
+        settings["transparency"] = trans_slider.get()
+        settings["height_percent"] = height_slider.get()
+        save_settings(settings)
+
+    tk.Button(inner, text="Save Settings", command=save_settings_panel).pack(pady=10)
+
+def toggle_settings_panel():
+    global settings_panel, settings_visible
+
+    if settings_panel is None:
+        return
+
+    if settings_visible:
+        settings_panel.pack_forget()
+        settings_visible = False
+    else:
+        settings_panel.pack(fill="x")
+        settings_visible = True
+
+def handle_add_command(line: str):
+    rest = line[4:].strip()
+    if not rest:
+        print("ADD usage: ADD: englishWord, finnishWord")
+        return
+    if "," not in rest:
+        print("ADD usage: ADD: englishWord, finnishWord")
+        return
+    left, right = rest.split(",", 1)
+    eng = left.strip()
+    fin = right.strip()
+    if not eng or not fin:
+        print("ADD usage: ADD: englishWord, finnishWord")
+        return
+    store_override(eng, fin)
+    print(f"Override added: '{eng}' → '{fin}'")
+def handle_remove_command(line: str):
+    rest = line[7:].strip()
+    if not rest:
+        print("REMOVE usage: REMOVE: englishWord OR REMOVE: finnishWord")
+        return
+    target = rest.lower().strip()
+    with over_lock:
+        over_cur.execute("SELECT english, finnish FROM overrides WHERE english = ?", (target,))
+        row = over_cur.fetchone()
+        if row:
+            over_cur.execute("DELETE FROM overrides WHERE english = ?", (target,))
+            over_conn.commit()
+            print(f"Removed override: {row[0]} → {row[1]}")
+            return
+    with over_lock:
+        over_cur.execute("SELECT english, finnish FROM overrides")
+        rows = over_cur.fetchall()
+    for en, fi in rows:
+        if fi.lower().strip() == target:
+            with over_lock:
+                over_cur.execute("DELETE FROM overrides WHERE english = ?", (en,))
+                over_conn.commit()
+            print(f"Removed override: {en} → {fi}")
+            return
+
+    print(f"No override found matching '{target}'.")
+
+def console_loop():
+    print("Shift+N to open Finnish spotlight search.")
+    print("CMD mode:")
+    print("  - english-text        → EN → FI")
+    print("  - !finnish-text       → FI → EN (whole string, reverse overrides first)")
+    print("  - ADD: en, fi         → add override (english → finnish)")
+    print("  - quitt / exitt       → leave CMD loop\n")
+    print("  - REMOVE: en-OR-fi    → remove an override by typing its english or finnish word")
+
+    while True:
+        try:
+            line = input("lookup: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not line:
+            continue
+
+        lower = line.lower()
+        if lower in ("quitt", "exitt"):
+            print("Shutting down...")
+            shutdown_program()
+            return
+
+        if lower.startswith("add:"):
+            handle_add_command(line)
+            continue
+        if lower.startswith("remove:"):
+            handle_remove_command(line)
+            continue
+        if line.startswith("!"):
+            fi_text = line[1:].strip()
+            if not fi_text:
+                print("No Finnish text provided after '!'.")
+                continue
+            en_text = translate_fi_to_en(fi_text)
+            if en_text:
+                print(f"{fi_text} → {en_text}")
+            else:
+                print(f"{fi_text} → (no translation available)")
+            continue
+        if " " in line:
+            fi = translate_en_to_fi_with_cache_and_overrides(line)
+            print(f"{line} → {fi}")
+            continue
+        items = lookup_word(line)
+        if not items:
+            print(f'"{line}" → (no results)')
+            continue
+        print(f'\n"{line}" →')
+        for fi, en in items:
+            print(f"  {FI_COLOR}{fi}{RESET} ({EN_COLOR}{en}{RESET})")
+        print()
+
+cmd_thread = threading.Thread(target=console_loop, daemon=True)
+cmd_thread.start()
+root.mainloop()
+if shutdown_flag:
+    import sys
+    sys.exit(0)
