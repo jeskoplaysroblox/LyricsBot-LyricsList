@@ -166,6 +166,26 @@ def normalize_token(s: str) -> str:
     s = punct_re.sub("", s)
     return s
 
+import sqlite3
+
+MEAN_DB_PATH = "meanings.db"
+
+def init_meanings_db():
+    conn = sqlite3.connect(MEAN_DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS meanings (
+        word TEXT PRIMARY KEY,
+        meaning1 TEXT,
+        meaning2 TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+# Call this once at startup (same place you init lexicon.db etc.)
+init_meanings_db()
+
 def fetch_synonyms_from_api(word):
     try:
         resp = requests.get(
@@ -225,6 +245,94 @@ def store_override(english_word, finnish_word):
         )
         over_conn.commit()
 
+import requests
+import re
+
+RE_TEMPLATE = re.compile(r"\{\{[^{}]*\}\}")
+RE_LINK = re.compile(r"\[\[(?:[^\|\]]*\|)?([^\]]+)\]\]")
+RE_QUOTES = re.compile(r"'{2,}")
+RE_COLON = re.compile(r"^[:;]+")
+
+def clean_line(text: str) -> str:
+    text = RE_TEMPLATE.sub("", text)
+    text = RE_LINK.sub(r"\1", text)
+    text = RE_QUOTES.sub("", text)
+    text = RE_COLON.sub("", text)
+    return text.strip()
+
+def fetch_top_two_meanings(word):
+    url = "https://en.wiktionary.org/w/api.php"
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "revisions",
+        "titles": word,
+        "rvprop": "content",
+        "rvslots": "main",
+        "redirects": 1,
+    }
+
+    resp = requests.get(url, params=params, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    })
+    data = resp.json()
+
+    pages = data.get("query", {}).get("pages", {})
+    for _, page in pages.items():
+        revs = page.get("revisions")
+        if not revs:
+            return []
+
+        wikitext = revs[0]["slots"]["main"]["*"]
+
+        # Extract only the Finnish section
+        finnish = []
+        capture = False
+        for line in wikitext.splitlines():
+            if line.startswith("==Finnish=="):
+                capture = True
+                continue
+            if capture and line.startswith("==") and not line.startswith("==="):
+                break
+            if capture:
+                finnish.append(line)
+
+        meanings = []
+        for raw in finnish:
+            line = raw.strip()
+            if line.startswith("#") and not line.startswith("##"):
+                cleaned = clean_line(line[1:].strip())
+                if cleaned and re.match(r"^[A-Za-z\s!?]+$", cleaned):
+                    meanings.append(cleaned)
+
+        return meanings[:2]  # return at most two
+
+def store_meanings(word, meanings):
+    if not meanings:
+        return
+
+    m1 = meanings[0] if len(meanings) > 0 else None
+    m2 = meanings[1] if len(meanings) > 1 else None
+
+    # New connection per call – thread-safe
+    conn = sqlite3.connect(MEAN_DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO meanings (word, meaning1, meaning2)
+        VALUES (?, ?, ?)
+    """, (word.lower(), m1, m2))
+    conn.commit()
+    conn.close()
+
+def process_word_meanings(word):
+    word = word.lower().strip()
+    if " " in word:
+        return  # only store meanings for single words
+
+    meanings = fetch_top_two_meanings(word)
+    if meanings:
+        store_meanings(word, meanings)
+        print(f"Stored meanings for {word}: {meanings}")
 
 def get_reverse_override(finnish_text):
     if not finnish_text:
@@ -240,6 +348,26 @@ def get_reverse_override(finnish_text):
             return en
     return None
 
+# Treat as "word" only if it's a single token with letters, at least 2 chars
+word_pattern = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿ'-]{2,}$")
+
+def is_single_word(s: str) -> bool:
+    s = s.strip()
+    if " " in s:
+        return False
+    return bool(word_pattern.match(s))
+
+def is_valid_translation(src: str, dst: str) -> bool:
+    src = src.strip().lower()
+    dst = dst.strip().lower()
+    if not src or not dst:
+        return False
+    # Don't cache if Google basically echoed the input
+    if src == dst:
+        return False
+    # Destination must look like a word as well
+    return is_single_word(dst)
+
 def get_translation_from_cache(word):
     word = word.lower().strip()
     if not word:
@@ -253,31 +381,68 @@ def get_translation_from_cache(word):
 def store_translation(word, finnish):
     word = word.lower().strip()
     finnish = finnish.strip()
-    if not word or not finnish:
+
+    # Only cache if this looks like a single word and translation is valid
+    if not is_single_word(word):
         return
+    if not is_valid_translation(word, finnish):
+        return
+
     with lex_lock:
         lex_cur.execute(
             "INSERT OR REPLACE INTO translations (english, finnish) VALUES (?, ?)",
             (word, finnish)
         )
-        lex_conn.commit()
+    lex_conn.commit()
 
-def translate_en_to_fi_with_cache_and_overrides(word):
-    word = word.lower().strip()
-    if not word:
+import re
+
+def tokenize_sentence(text):
+    # Split on spaces and punctuation, keep only word-like tokens
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'-]+", text)
+    return tokens
+
+def translate_en_to_fi_with_cache_and_overrides(text):
+    text = text.strip()
+    if not text:
         return ""
-    ov = get_override(word)
-    if ov:
-        return ov
-    cached = get_translation_from_cache(word)
-    if cached:
-        return cached
+
+    # SINGLE WORD LOGIC
+    if is_single_word(text):
+        ov = get_override(text)
+        if ov:
+            # Store meanings for overridden words too
+            process_word_meanings(text)
+            return ov
+
+        cached = get_translation_from_cache(text)
+        if cached:
+            # Meanings should still be stored if not already
+            process_word_meanings(text)
+            return cached
+
+        # Fresh translation
+        try:
+            fi = translator_en_fi.translate(text)
+        except Exception:
+            fi = ""
+
+        if fi:
+            store_translation(text, fi)
+            process_word_meanings(text)   # <-- ADD THIS LINE
+        return fi
+
+    # MULTI-WORD SENTENCE LOGIC
     try:
-        fi = translator_en_fi.translate(word)
+        fi = translator_en_fi.translate(text)
     except Exception:
         fi = ""
-    if fi:
-        store_translation(word, fi)
+
+    # Process meanings for each word in the sentence
+    for token in tokenize_sentence(text):
+        if is_single_word(token):
+            process_word_meanings(token)
+
     return fi
 
 def translate_fi_to_en(text):
